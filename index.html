@@ -122,6 +122,19 @@
   .base-row td { background: #f0f9ff !important; font-weight: 600; }
   .save-row td { background: #ecfdf5 !important; font-weight: 600; }
   .save-badge { color: var(--ok); font-size: 12px; font-weight: 600; }
+  /* 方式对比表 */
+  .cmp-table td, .cmp-table th { padding: 8px 10px; font-size: 13px; }
+  .cmp-table .best { color: var(--ok); font-weight: 700; }
+  .cmp-table .worse { color: var(--danger); }
+  /* 还款曲线图 */
+  .chart-wrap { margin-top: 14px; }
+  .chart-wrap svg { width: 100%; height: auto; display: block; }
+  .chart-legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; margin-top: 8px; }
+  .chart-legend .lg { display: inline-flex; align-items: center; gap: 6px; }
+  .chart-legend .dot { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+  /* 导出按钮 */
+  .btn-export { background: #f0fdf4; color: var(--ok); border: 1px solid #bbf7d0; }
+  .btn-export:hover { background: #dcfce7; }
   /* 方案对比表紧凑样式 */
   #planCompareTable td, #planCompareTable th { padding: 7px 8px; font-size: 13px; }
   @media (max-width: 480px) {
@@ -305,7 +318,26 @@
     <div id="warningBox"></div>
   </div>
 
+  <!-- 还款方式对比 -->
   <div class="card">
+    <h2>等额本息 vs 等额本金 <span class="tag">同参数纯对比</span></h2>
+    <div class="table-wrap" style="max-height:none;">
+      <table class="cmp-table" id="cmpTable"></table>
+    </div>
+    <p class="muted" style="margin-top:8px;">口径：仅切换还款方式，不含提前还款/利率调整。期限固定时等额本金总利息更少（前期月供高）；本工具支持两种方式各自设定。</p>
+  </div>
+
+  <!-- 还款曲线 -->
+  <div class="card">
+    <h2>还款曲线 <span class="tag">剩余本金 + 累计利息</span></h2>
+    <div class="chart-wrap" id="chartWrap"></div>
+  </div>
+
+  <div class="card">
+    <div class="list-head">
+      <h2 style="margin:0;">还款明细</h2>
+      <button class="btn btn-export" onclick="exportCSV()">⬇ 导出 CSV</button>
+    </div>
     <div class="tabs" id="tabBar">
       <div class="tab active" data-tab="all">总览</div>
       <div class="tab" data-tab="c">商贷明细</div>
@@ -693,7 +725,157 @@ function renderPlanCompare() {
   table.innerHTML = html;
 }
 
-/* 绑定还款方式切换 */
+/* ---------- 方式对比：等额本息 vs 等额本金（同参数纯对比，不含提前还款/利率调整） ---------- */
+function renderMethodCompare(c, f) {
+  const table = $('cmpTable');
+  const loans = [];
+  if (c.amount > 0) loans.push({ key: 'c', label: '商贷', amount: c.amount, rate: c.rate, months: c.months });
+  if (f.amount > 0) loans.push({ key: 'f', label: '公积金', amount: f.amount, rate: f.rate, months: f.months });
+  if (!loans.length) { table.innerHTML = ''; return; }
+
+  let html = '<thead><tr><th>贷款</th><th>还款方式</th><th>首月月供</th><th>末月月供</th><th>总利息</th><th>本息合计</th><th>清贷</th></tr></thead><tbody>';
+  loans.forEach(L => {
+    const simA = simulateLoan({ amount: L.amount, rate: L.rate, months: L.months, method: 'annuity', prepays: [], rateAdjs: [] });
+    const simE = simulateLoan({ amount: L.amount, rate: L.rate, months: L.months, method: 'equal', prepays: [], rateAdjs: [] });
+    const rowsA = simA.rows, rowsE = simE.rows;
+    const lastA = rowsA[rowsA.length - 1], lastE = rowsE[rowsE.length - 1];
+    const payA1 = rowsA[0].principal + rowsA[0].interest;
+    const payE1 = rowsE[0].principal + rowsE[0].interest;
+    const payAL = lastA.principal + lastA.interest;
+    const payEL = lastE.principal + lastE.interest;
+    const intA = simA.totalInterest, intE = simE.totalInterest;
+    // 更优者高亮（总利息少 = 好）
+    const better = intA <= intE ? 'annuity' : 'equal';
+    const cls = m => m === better ? 'best' : 'worse';
+    html += `<tr><td rowspan="2">${L.label}<br><span class="muted">${fmt(L.amount)}元 · ${L.rate*100}% · ${L.months}期</span></td>
+      <td class="${cls('annuity')}">等额本息</td><td>¥${fmt(payA1)}</td><td>¥${fmt(payAL)}</td>
+      <td class="${cls('annuity')}">¥${fmt(intA)}</td><td>¥${fmt(L.amount + intA)}</td><td>${simA.months}期</td></tr>`;
+    html += `<tr><td class="${cls('equal')}">等额本金</td><td>¥${fmt(payE1)}</td><td>¥${fmt(payEL)}</td>
+      <td class="${cls('equal')}">¥${fmt(intE)}</td><td>¥${fmt(L.amount + intE)}</td><td>${simE.months}期</td></tr>`;
+  });
+  html += '</tbody>';
+  table.innerHTML = html;
+}
+
+/* ---------- 还款曲线：剩余本金 + 累计利息（SVG 零依赖） ---------- */
+function renderChart(simC, simF, maxM) {
+  const wrap = $('chartWrap');
+  if (!maxM) { wrap.innerHTML = ''; return; }
+  const cRows = simC ? simC.rows : [];
+  const fRows = simF ? simF.rows : [];
+
+  // 逐期合计：剩余本金、累计利息
+  let cumC = 0, cumF = 0;
+  const balPts = [], intPts = [];
+  for (let m = 1; m <= maxM; m++) {
+    const c = cRows[m - 1], f = fRows[m - 1];
+    const bal = (c ? c.balance : 0) + (f ? f.balance : 0);
+    cumC += c ? c.interest : 0;
+    cumF += f ? f.interest : 0;
+    balPts.push({ m, v: bal });
+    intPts.push({ m, v: cumC + cumF });
+  }
+
+  const W = 720, H = 260, padL = 70, padR = 16, padT = 16, padB = 34;
+  const x = m => padL + (m - 1) / (maxM - 1) * (W - padL - padR);
+  const maxV = Math.max(...balPts.map(p => p.v), ...intPts.map(p => p.v), 1);
+  const y = v => padT + (1 - v / maxV) * (H - padT - padB);
+
+  function path(pts) {
+    return pts.map((p, i) => (i === 0 ? 'M' : 'L') + x(p.m).toFixed(1) + ',' + y(p.v).toFixed(1)).join(' ');
+  }
+  function areaPath(pts) {
+    return path(pts) + ` L${x(pts[pts.length-1].m).toFixed(1)},${H - padB} L${x(pts[0].m).toFixed(1)},${H - padB} Z`;
+  }
+
+  // Y 轴刻度（4 档）
+  let ticks = '';
+  for (let i = 0; i <= 4; i++) {
+    const v = maxV * (4 - i) / 4;
+    const yy = y(v);
+    ticks += `<line x1="${padL}" y1="${yy}" x2="${W-padR}" y2="${yy}" stroke="#e2e8f0" stroke-width="1"/>
+      <text x="${padL-8}" y="${yy+4}" text-anchor="end" font-size="11" fill="#64748b">${fmt(v)}</text>`;
+  }
+  // X 轴刻度（约 6 档）
+  const step = Math.max(1, Math.round(maxM / 6));
+  let xTicks = '';
+  for (let m = 1; m <= maxM; m += step) {
+    xTicks += `<text x="${x(m)}" y="${H-12}" text-anchor="middle" font-size="11" fill="#64748b">${m}期</text>`;
+  }
+
+  const balColor = '#2563eb', intColor = '#f59e0b';
+  wrap.innerHTML = `
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="还款曲线">
+      ${ticks}${xTicks}
+      <path d="${areaPath(balPts)}" fill="${balColor}" opacity="0.08" stroke="none"/>
+      <path d="${path(balPts)}" fill="none" stroke="${balColor}" stroke-width="2"/>
+      <path d="${path(intPts)}" fill="none" stroke="${intColor}" stroke-width="2" stroke-dasharray="6 4"/>
+      <text x="${padL}" y="${padT+8}" font-size="12" fill="${balColor}">剩余本金</text>
+      <text x="${padL+70}" y="${padT+8}" font-size="12" fill="${intColor}">累计利息</text>
+    </svg>
+    <div class="chart-legend">
+      <span class="lg"><span class="dot" style="background:${balColor}"></span>剩余本金</span>
+      <span class="lg"><span class="dot" style="background:${intColor}"></span>累计利息</span>
+      <span class="muted">曲线基于当前参数（含提前还款/利率调整）</span>
+    </div>`;
+}
+
+/* ---------- CSV 导出 ---------- */
+function exportCSV() {
+  if (!gSimC && !gSimF) { alert('请先计算'); return; }
+  const cRows = gSimC ? gSimC.rows : [];
+  const fRows = gSimF ? gSimF.rows : [];
+  const maxM = gMaxM;
+  const hasC = !!gSimC, hasF = !!gSimF;
+
+  const head = ['期数'];
+  if (hasC) head.push('商贷月供', '商贷本金', '商贷利息', '商贷余额');
+  if (hasF) head.push('公积金月供', '公积金本金', '公积金利息', '公积金余额');
+  if (hasC && hasF) head.push('合计月供');
+
+  const lines = [head.join(',')];
+  const cell = v => Number.isFinite(v) ? v.toFixed(2) : '';
+  for (let m = 1; m <= maxM; m++) {
+    const c = cRows[m - 1], f = fRows[m - 1];
+    if (!c && !f) continue;
+    const cells = [String(m)];
+    if (hasC) {
+      if (c) cells.push(cell(c.principal + c.interest), cell(c.principal), cell(c.interest), cell(c.balance));
+      else cells.push('', '', '', '');
+    }
+    if (hasF) {
+      if (f) cells.push(cell(f.principal + f.interest), cell(f.principal), cell(f.interest), cell(f.balance));
+      else cells.push('', '', '', '');
+    }
+    if (hasC && hasF) {
+      cells.push(cell((c ? c.principal + c.interest : 0) + (f ? f.principal + f.interest : 0)));
+    }
+    lines.push(cells.join(','));
+  }
+  // 汇总行
+  const sum = [];
+  if (hasC) {
+    const tp = cRows.reduce((s, r) => s + r.principal, 0);
+    const ti = cRows.reduce((s, r) => s + r.interest, 0);
+    sum.push('合计', cell(tp + ti), cell(tp), cell(ti), '0.00');
+  }
+  if (hasF) {
+    const tp = fRows.reduce((s, r) => s + r.principal, 0);
+    const ti = fRows.reduce((s, r) => s + r.interest, 0);
+    sum.push('', cell(tp + ti), cell(tp), cell(ti), '0.00');
+  }
+  if (sum.length) lines.push(sum.join(','));
+
+  const blob = new Blob(['\ufeff' + lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+  const a = document.createElement('a');
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  a.href = URL.createObjectURL(blob);
+  a.download = `房贷明细_${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 200);
+}
 document.querySelectorAll('.switch-row').forEach(sw => {
   sw.querySelectorAll('.pill').forEach(p => {
     p.addEventListener('click', () => {
@@ -772,6 +954,8 @@ function calculate() {
   renderTable(simC, simF, maxM);
   renderWarnings({ simC, simF, c, f, cPrepay, fPrepay, cAdj, fAdj, maxM });
   renderPlanCompare();
+  renderMethodCompare(c, f);
+  renderChart(simC, simF, maxM);
   $('resultArea').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
