@@ -1,5 +1,6 @@
 # 备份文件不入库
 index_backup_*.html
+*.bak
 
 # Python
 __pycache__/
